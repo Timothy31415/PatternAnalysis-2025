@@ -3,7 +3,7 @@ This file contains the data loader for loading and preprocessing data.
 It is used in train.py and predict.py.  (No skimage dependency.)
 """
 
-import os, glob
+import os, glob, random
 from typing import List, Tuple, Optional, Sequence
 import numpy as np
 import nibabel as nib
@@ -17,13 +17,8 @@ import torch.nn.functional as F
 # Utilities
 # ------------------------------
 
-def to_channels(arr: np.ndarray, num_classes: int = 5, dtype=np.uint8) -> np.ndarray:
-    """
-    One-hot encode a label map into 'num_classes' channels.
-    Any label >= num_classes will be clipped.
-    arr: (H,W) integers
-    returns: (H,W,C)
-    """
+def to_channels(arr: np.ndarray, num_classes: int = 6, dtype=np.uint8) -> np.ndarray:
+    """One-hot encode a label map into 'num_classes' channels."""
     h, w = arr.shape
     res = np.zeros((h, w, num_classes), dtype=dtype)
     lab = np.clip(arr.astype(np.int64), 0, num_classes - 1)
@@ -38,18 +33,26 @@ def _zscore(img: np.ndarray, clip: Optional[float] = 5.0) -> np.ndarray:
     return out
 
 def _resize2d_torch(img2d: np.ndarray, out_hw: Tuple[int,int], is_label: bool) -> np.ndarray:
-    """
-    Resize a 2D numpy array via torch.interpolate.
-    - Images: bilinear + align_corners=False
-    - Labels: nearest
-    Keeps values in original dtype range (uses float32 internally).
-    """
+    """Resize 2D numpy array using torch.interpolate."""
     H, W = img2d.shape
-    t = torch.from_numpy(img2d.astype(np.float32)).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    t = torch.from_numpy(img2d.astype(np.float32)).unsqueeze(0).unsqueeze(0)
     mode = "nearest" if is_label else "bilinear"
     t_res = F.interpolate(t, size=out_hw, mode=mode, align_corners=False if mode=="bilinear" else None)
-    out = t_res.squeeze(0).squeeze(0).cpu().numpy()
-    return out
+    return t_res.squeeze(0).squeeze(0).cpu().numpy()
+
+def _random_flip(img: np.ndarray, mask: Optional[np.ndarray] = None, p: float = 0.5):
+    """Apply random horizontal and vertical flips (same to mask if given)."""
+    # Horizontal (left-right)
+    if random.random() < p:
+        img = np.flip(img, axis=1)
+        if mask is not None:
+            mask = np.flip(mask, axis=1)
+    # Vertical (top-bottom)
+    if random.random() < p:
+        img = np.flip(img, axis=0)
+        if mask is not None:
+            mask = np.flip(mask, axis=0)
+    return img, mask
 
 # ------------------------------
 # Loaders (single-list and paired)
@@ -63,22 +66,18 @@ def load_data_2D(
     getAffines: bool = False,
     early_stop: bool = False,
     out_size: Tuple[int,int] = (256, 128),
-    num_classes: int = 5
+    num_classes: int = 6,
+    augment: bool = False,
+    flip_p: float = 0.5
 ):
     """
-    Load 2D NIfTI images into a preallocated numpy array (no skimage).
-    If 'categorical' is True, one-hot encode with 'num_classes' channels.
-
-    Returns:
-        images  -> (N,H,W) or (N,H,W,C)
-        [affines] -> list of affines if getAffines=True
+    Load 2D NIfTI images. If augment=True, applies random flips per slice.
+    Returns (N,H,W) or (N,H,W,C)
     """
     affines = []
-
-    # probe first case to preallocate
     first = nib.load(imageNames[0]).get_fdata(caching="unchanged")
     if first.ndim == 3:
-        first = first[:, :, 0]  # HipMRI sometimes has a dummy 3rd dim
+        first = first[:, :, 0]
     first = _resize2d_torch(first, out_size, is_label=categorical)
 
     if categorical:
@@ -94,18 +93,14 @@ def load_data_2D(
         arr = ni.get_fdata(caching="unchanged")
         if arr.ndim == 3:
             arr = arr[:, :, 0]
-
         arr = _resize2d_torch(arr, (rows, cols), is_label=categorical).astype(dtype)
-
         if normImage and not categorical:
             arr = _zscore(arr)
-
+        if augment:
+            arr, _ = _random_flip(arr, None, p=flip_p)
         if categorical:
             arr = to_channels(arr.astype(np.int64), num_classes=num_classes, dtype=dtype)
-            images[i, ...] = arr
-        else:
-            images[i, ...] = arr
-
+        images[i, ...] = arr
         affines.append(ni.affine)
         if early_stop and i > 20:
             break
@@ -118,39 +113,35 @@ def load_paired_2D(
     lab_paths: Sequence[str],
     normImage: bool = True,
     out_size: Tuple[int,int] = (256, 128),
-    num_classes: int = 2,
+    num_classes: int = 6,
     dtype_img=np.float32,
-    dtype_lab=np.uint8
+    dtype_lab=np.uint8,
+    augment: bool = False,
+    flip_p: float = 0.5
 ):
     """
-    Load paired image+label NIfTIs into aligned 2D arrays (no skimage).
-
-    Returns:
-        X -> (N,H,W) float32
-        Y -> (N,H,W,C) one-hot uint8 (C=num_classes)
+    Load paired image+label NIfTIs.
+    If augment=True, applies random vertical/horizontal flips to both.
     """
-    assert len(img_paths) == len(lab_paths), "img_paths and lab_paths must align"
+    assert len(img_paths) == len(lab_paths)
     X, Y = [], []
 
     for ip, lp in tqdm(list(zip(img_paths, lab_paths)), total=len(img_paths), desc="Loading paired 2D"):
-        ni = nib.load(ip); li = nib.load(lp)
-
-        img = ni.get_fdata(caching="unchanged")
+        ni, li = nib.load(ip), nib.load(lp)
+        img, lab = ni.get_fdata(caching="unchanged"), li.get_fdata(caching="unchanged")
         if img.ndim == 3: img = img[:, :, 0]
-        lab = li.get_fdata(caching="unchanged")
         if lab.ndim == 3: lab = lab[:, :, 0]
-
         img = _resize2d_torch(img, out_size, is_label=False).astype(dtype_img)
         lab = _resize2d_torch(lab, out_size, is_label=True).astype(np.int64)
-
         if normImage:
             img = _zscore(img)
-
+        if augment:
+            img, lab = _random_flip(img, lab, p=flip_p)
         X.append(img)
         Y.append(to_channels(lab, num_classes=num_classes, dtype=dtype_lab))
 
-    X = np.stack(X, axis=0)  # (N,H,W)
-    Y = np.stack(Y, axis=0)  # (N,H,W,C)
+    X = np.stack(X, axis=0)
+    Y = np.stack(Y, axis=0)
     return X, Y
 
 # ------------------------------
@@ -160,41 +151,47 @@ def load_paired_2D(
 def discover_cases_flat(folder: str, pattern: str = "*.nii*") -> List[str]:
     return sorted(glob.glob(os.path.join(folder, pattern)))
 
-def discover_paired(
-    root: str,
-    image_name: str = "t2.nii.gz",
-    label_name: str = "label.nii.gz"
-) -> Tuple[List[str], List[str]]:
-    imgs, labs = [], []
-    for d in sorted(glob.glob(os.path.join(root, "*"))):
-        if not os.path.isdir(d): 
-            continue
-        ip = os.path.join(d, image_name)
-        lp = os.path.join(d, label_name)
-        if os.path.exists(ip) and os.path.exists(lp):
-            imgs.append(ip); labs.append(lp)
+def subfolder_list( root:str):
+    paths = []
+    for dirpath, _, filenames in os.walk(root):
+        for f in filenames:
+            full_path = os.path.join(dirpath, f)
+            paths.append(full_path)
+    return paths
+
+
+
+def discover_paired(root: str, type: str) -> Tuple[List[str], List[str]]:
+    if type == "train":
+        path_img = os.path.join(root,"keras_lices_train" )
+        path_lab = os.path.join(root,"keras_slices_seg_train" )
+
+    if type == "vallidate":
+        path_img = os.path.join(root,"keras_slices_vallidate" )
+        path_lab = os.path.join(root,"keras_slices_seg_vallidate" )
+
+    if type == "test":
+        print("dddd")
+        path_img = os.path.join(root,"keras_slices_test" )
+        path_lab = os.path.join(root,"keras_slices_seg_test" )
+
+    print(path_img)
+    imgs = subfolder_list(path_img)
+    labs = subfolder_list(path_lab)
     return imgs, labs
 
 # ------------------------------
 # Visualization
 # ------------------------------
 
-def visualize_example(
-    img: np.ndarray,
-    lab_oh: Optional[np.ndarray] = None,
-    title: str = "Sample (H×W)",
-    alpha: float = 0.4
-):
-    """
-    Show a single 2D image and (optional) one-hot label overlay.
-    """
+def visualize_example(img: np.ndarray, lab_oh: Optional[np.ndarray] = None, title="Sample (H×W)", alpha=0.4):
     plt.figure(figsize=(8, 4))
     if lab_oh is None:
-        plt.imshow(img, cmap="gray"); plt.title(title); plt.axis("off")
+        plt.imshow(_random_flip(img)[0], cmap="gray"); plt.title(title); plt.axis("off")
     else:
         lab = np.argmax(lab_oh, axis=-1)
-        plt.subplot(1, 2, 1); plt.imshow(img, cmap="gray"); plt.title(title); plt.axis("off")
-        plt.subplot(1, 2, 2); plt.imshow(img, cmap="gray"); plt.imshow(lab, alpha=alpha, interpolation="nearest")
+        plt.subplot(1,2,1); plt.imshow(img, cmap="gray"); plt.title(title); plt.axis("off")
+        plt.subplot(1,2,2); plt.imshow(img, cmap="gray"); plt.imshow(lab, alpha=alpha, interpolation="nearest")
         plt.title("Overlay"); plt.axis("off")
     plt.tight_layout(); plt.show()
 
@@ -203,11 +200,12 @@ def visualize_example(
 # ------------------------------
 
 if __name__ == "__main__":
-    demo_root = "/path/to/HipMRI"  # <-- change me
-    imgs, labs = discover_paired(demo_root, image_name="t2.nii.gz", label_name="label.nii.gz")
+    demo_root = os.getcwd()
+    data_root = os.path.join(demo_root,"keras_slices_data")
+    imgs, labs = discover_paired(data_root, "train")
     if len(imgs) == 0:
         print("No cases found in demo_root; please update the path.")
     else:
-        X, Y = load_paired_2D(imgs[:8], labs[:8], normImage=True, out_size=(256,128), num_classes=2)
+        X, Y = load_paired_2D(imgs[:8], labs[:8], normImage=True, out_size=(256,128), num_classes=6, augment=True)
         print("X:", X.shape, X.dtype, "Y:", Y.shape, Y.dtype)
-        visualize_example(X[0], Y[0], title="T2 slice with mask")
+        visualize_example(X[0], Y[0], title="Augmented slice")
