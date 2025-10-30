@@ -11,7 +11,21 @@ import matplotlib.pyplot as plt
 from dataset import load_paired_2D  # uses (H,W)=(256,128), no skimage
 from module import ImprovedUNet2D, DiceLoss, dice_score
 
-
+def dice_per_class_np(preds, gts, num_classes):
+    """
+    preds: (N,H,W) predicted integer masks
+    gts:   (N,H,W) ground truth integer masks
+    returns: np.array of per-class dice
+    """
+    dice_scores = []
+    for c in range(num_classes):
+        p = (preds == c).astype(np.uint8)
+        g = (gts == c).astype(np.uint8)
+        inter = np.sum(p * g)
+        union = np.sum(p) + np.sum(g)
+        d = (2. * inter) / (union + 1e-6)
+        dice_scores.append(d)
+    return np.array(dice_scores)
 # ----------------------- utils -----------------------
 def seed_everything(seed: int = 42):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -23,20 +37,18 @@ def seed_everything(seed: int = 42):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", type=str, required=True)
-    p.add_argument("--image_subdir", type=str, default="original")
-    p.add_argument("--label_subdir", type=str, default="label")
-    p.add_argument("--image_name", type=str, default="t2.nii.gz")
-    p.add_argument("--label_name", type=str, default="label.nii.gz")
+    p.add_argument("--verbose", action ="store_true")
+    p.add_argument("--eval_all",action="store_true")
 
     p.add_argument("--height", type=int, default=256)
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--num_classes", type=int, default=6)
 
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--val_frac", type=float, default=0.2)
+
     p.add_argument("--augment", action="store_true")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -50,8 +62,9 @@ def main():
 
 
     #Load the dataset for train and validate
-    imgs_train, lab_train = discover_paired(args.data_root, "test" )
+    imgs_train, lab_train = discover_paired(args.data_root, "train" )
     imgs_val, lab_val = discover_paired(args.data_root, "validate" )
+    img_test, lab_test = discover_paired(args.data_root, "test")
 
     # ---- load arrays (NumPy) and convert to tensors ----
     out_size = (args.height, args.width)
@@ -82,9 +95,12 @@ def main():
 
     tr_ds  = TensorDataset(Xtr, Ytr)
     val_ds = TensorDataset(Xval, Yval)
-    tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=4, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
+    tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,
+                   num_workers=0, pin_memory=False, persistent_workers=False)
+    val_dl = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                   num_workers=0, pin_memory=False, persistent_workers=False)
+    
     # ---- model / loss / optim ----
     net = ImprovedUNet2D(in_channels=1, num_classes=args.num_classes, base=32, deep_supervision=True).to(device)
     ce = nn.CrossEntropyLoss()
@@ -108,7 +124,7 @@ def main():
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda',enabled=args.amp):
-                logits = net(xb)                     # (B,K,H,W)
+                logits = net(xb)       
                 loss = 0.5 * ce(logits, yb) + 0.5 * dice(logits, yb)
 
             scaler.scale(loss).backward()
@@ -128,7 +144,7 @@ def main():
                 yb = yb.to(device, non_blocking=True)
 
                 logits = net(xb)
-                loss = 0.5 * ce(logits, yb) + 0.5 * dice(logits, yb)
+                loss = 0.5 * ce(logits, yb) + 0.5 * dice(logits, yb) 
                 val_loss += loss.item()
                 dices.append(dice_score(logits, yb, ignore_bg=False))
                 m += 1
@@ -157,21 +173,55 @@ def main():
             }, args.save_path)
             print(f"  ✓ saved best to {args.save_path} (dice={epoch_dice:.4f})")
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(range(1,args.epochs+1),dice_plot, 'r-' )
-    plt.xlabel("Epochs No")
-    plt.ylabel("Dice")
-    plt.title("Epochs No vs Dice score in Training" )
-    plt.show()
+    if args.eval_all:
+        # 1) load paired arrays (images z-scored, labels nearest)
+        X_np, Y_oh = load_paired_2D(
+            img_test, lab_test,
+            normImage=True,
+            out_size=(args.height, args.width),
+            num_classes=args.num_classes,
+            augment=False
+        )
+        # 2)ground truth as class ids (N,H,W)
+        GT_np = np.argmax(Y_oh, axis=-1)
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(range(1,args.epochs+1),tr_loss_plot, 'r-', label = "Training loss" )
-    plt.plot(range(1,args.epochs+1),val_loss_plot, 'b-', label = "Validation loss" )
-    plt.legend(loc ='upper right')
-    plt.xlabel("Epochs No")
-    plt.ylabel("Loss")
-    plt.title("Epochs No vs Dice score in Training" )
-    plt.show()
+        # 3) tensor batch (N,1,H,W)
+        X = torch.from_numpy(X_np).unsqueeze(1).float().to(device)
+
+        # 5) batched inference
+        preds_chunks = []
+        with torch.no_grad(), torch.amp.autocast('cuda',enabled=args.amp):
+            for i in range(0, X.shape[0], 4):
+                xb = X[i:i+4]
+                logits = net(xb)                              # (B,K,H,W)
+                pred = torch.softmax(logits, dim=1).argmax(1) # (B,H,W)
+                preds_chunks.append(pred.cpu().numpy())
+        PRED_np = np.concatenate(preds_chunks, axis=0)       # (N,H,W)
+
+        # 6) per-class Dice
+        dpc = dice_per_class_np(PRED_np, GT_np, num_classes=args.num_classes)
+        print("\n=== Per-class Dice on test set ===")
+        for k, s in enumerate(dpc):
+            print(f"Class {k}: {s:.4f}")
+        print(f"Mean Dice: {dpc.mean():.4f}")
+
+
+    if args.verbose:
+        plt.figure(figsize=(12, 4))
+        plt.plot(range(1,args.epochs+1),dice_plot, 'r-' )
+        plt.xlabel("Epochs No")
+        plt.ylabel("Dice score (Validation)")
+        plt.title("Epochs No vs Dice score" )
+        plt.show()
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(range(1,args.epochs+1),tr_loss_plot, 'r-', label = "Training loss" )
+        plt.plot(range(1,args.epochs+1),val_loss_plot, 'b-', label = "Validation loss" )
+        plt.legend(loc ='upper right')
+        plt.xlabel("Epochs No")
+        plt.ylabel("Loss")
+        plt.title("Epochs No vs Training and validation loss" )
+        plt.show()
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import numpy as np
 # --------- small helpers ---------
 def conv3x3(cin, cout, s=1):
     return nn.Conv2d(cin, cout, kernel_size=3, stride=s, padding=1, bias=False)
