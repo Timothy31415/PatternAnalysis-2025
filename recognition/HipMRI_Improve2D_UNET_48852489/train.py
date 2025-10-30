@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt 
 
 from dataset import load_paired_2D  # uses (H,W)=(256,128), no skimage
 from module import ImprovedUNet2D, DiceLoss, dice_score
@@ -92,8 +93,11 @@ def main():
     scaler = torch.amp.GradScaler('cuda',enabled=args.amp)
 
     best_val = -1.0
+    dice_plot = [] #Plotting purpose
+    tr_loss_plot = []
+    val_loss_plot =[]
     for epoch in range(1, args.epochs + 1):
-        print("Training: " + epoch)
+        print(f"Training: {epoch}")
         net.train()
         t0 = time.time()
         tr_loss, n_batches = 0.0, 0
@@ -114,6 +118,7 @@ def main():
             tr_loss += loss.item()
             n_batches += 1
 
+        
         # ---- validation ----
         net.eval()
         val_loss, dices, m = 0.0, [], 0
@@ -129,9 +134,14 @@ def main():
                 m += 1
 
         epoch_tr = tr_loss / max(n_batches, 1)
+        tr_loss_plot.append(epoch_tr)
+
         epoch_val = val_loss / max(m, 1)
+        val_loss_plot.append(epoch_val)
+
         epoch_dice = float(np.mean(dices)) if dices else 0.0
         dt = time.time() - t0
+        dice_plot.append(epoch_dice) #plotting purpose
         print(f"[{epoch:03d}] train {epoch_tr:.4f} | val {epoch_val:.4f} | dice {epoch_dice:.4f} | {dt:.1f}s")
 
         # save best by dice
@@ -146,6 +156,22 @@ def main():
                 "num_classes": args.num_classes,
             }, args.save_path)
             print(f"  ✓ saved best to {args.save_path} (dice={epoch_dice:.4f})")
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(range(1,args.epochs+1),dice_plot, 'r-' )
+    plt.xlabel("Epochs No")
+    plt.ylabel("Dice")
+    plt.title("Epochs No vs Dice score in Training" )
+    plt.show()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(range(1,args.epochs+1),tr_loss_plot, 'r-', label = "Training loss" )
+    plt.plot(range(1,args.epochs+1),val_loss_plot, 'b-', label = "Validation loss" )
+    plt.legend(loc ='upper right')
+    plt.xlabel("Epochs No")
+    plt.ylabel("Loss")
+    plt.title("Epochs No vs Dice score in Training" )
+    plt.show()
 
 
 if __name__ == "__main__":

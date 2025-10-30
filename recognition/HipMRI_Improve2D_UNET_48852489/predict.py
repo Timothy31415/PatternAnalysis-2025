@@ -9,7 +9,21 @@ import random as rd
 from dataset import *
 
 from module import ImprovedUNet2D     # your model
-
+def dice_per_class_np(preds, gts, num_classes):
+    """
+    preds: (N,H,W) predicted integer masks
+    gts:   (N,H,W) ground truth integer masks
+    returns: np.array of per-class dice
+    """
+    dice_scores = []
+    for c in range(num_classes):
+        p = (preds == c).astype(np.uint8)
+        g = (gts == c).astype(np.uint8)
+        inter = np.sum(p * g)
+        union = np.sum(p) + np.sum(g)
+        d = (2. * inter) / (union + 1e-6)
+        dice_scores.append(d)
+    return np.array(dice_scores)
 
 def plot_triplet(img_hw: np.ndarray, pred_hw: np.ndarray, gt_hw: np.ndarray, case_id: str,
                  alpha_overlay: float = 0.65, save_fig: str | None = None):
@@ -61,16 +75,11 @@ def main():
 
     ap.add_argument("--model_path", type=str, required=True)
 
-    # how to choose the case
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--case_idx", type=int, default=0,
-                   help="0-based index into discovered cases")
-    g.add_argument("--case_id", type=str, default=None,
-                   help="case folder name to select (overrides --case_idx)")
-
     ap.add_argument("--save_fig", type=str, default=None,
                     help="optional path to save the 1x3 figure (e.g., fig/pred_case001.png)")
     ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--eval_all",action="store_true")
+
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,6 +87,48 @@ def main():
 
     img_test, lab_test = discover_paired(args.data_root, "test")
 
+    if args.eval_all:
+        # 1) load paired arrays (images z-scored, labels nearest)
+        X_np, Y_oh = load_paired_2D(
+            img_test, lab_test,
+            normImage=True,
+            out_size=(args.height, args.width),
+            num_classes=args.num_classes,
+            augment=False
+        )
+        # 2)ground truth as class ids (N,H,W)
+        GT_np = np.argmax(Y_oh, axis=-1)
+
+        # 3) tensor batch (N,1,H,W)
+        X = torch.from_numpy(X_np).unsqueeze(1).float().to(device)
+
+        # 4) load model once
+        ckpt = torch.load(args.model_path, map_location=device)
+        num_classes = ckpt.get("num_classes", args.num_classes)
+        net = ImprovedUNet2D(in_channels=1, num_classes=num_classes, base=32, deep_supervision=True).to(device)
+        net.load_state_dict(ckpt["model_state"])
+        net.eval()
+
+        # 5) batched inference
+        preds_chunks = []
+        with torch.no_grad(), torch.amp.autocast('cuda',enabled=args.amp):
+            for i in range(0, X.shape[0], 4):
+                xb = X[i:i+4]
+                logits = net(xb)                              # (B,K,H,W)
+                pred = torch.softmax(logits, dim=1).argmax(1) # (B,H,W)
+                preds_chunks.append(pred.cpu().numpy())
+        PRED_np = np.concatenate(preds_chunks, axis=0)       # (N,H,W)
+
+        # 6) per-class Dice
+        dpc = dice_per_class_np(PRED_np, GT_np, num_classes=args.num_classes)
+        print("\n=== Per-class Dice on test set ===")
+        for k, s in enumerate(dpc):
+            print(f"Class {k}: {s:.4f}")
+        print(f"Mean Dice: {dpc.mean():.4f}")
+
+        # if you only want eval_all, stop here:
+        return
+    
     if args.case_root == "1":
         lab_idx = 1
         args.case_root = img_test[lab_idx]
