@@ -63,7 +63,7 @@ def main():
         augment=args.augment,  # flips on train
         flip_p=0.5
     )
-    
+
     Xval_np, Yval_np = load_paired_2D(
         imgs_val, lab_val,
         normImage=True,
@@ -89,10 +89,11 @@ def main():
     ce = nn.CrossEntropyLoss()
     dice = DiceLoss()
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler('cuda',enabled=args.amp)
 
     best_val = -1.0
     for epoch in range(1, args.epochs + 1):
+        print("Training: " + epoch)
         net.train()
         t0 = time.time()
         tr_loss, n_batches = 0.0, 0
@@ -102,7 +103,7 @@ def main():
             yb = yb.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=args.amp):
+            with torch.amp.autocast('cuda',enabled=args.amp):
                 logits = net(xb)                     # (B,K,H,W)
                 loss = 0.5 * ce(logits, yb) + 0.5 * dice(logits, yb)
 
@@ -116,7 +117,7 @@ def main():
         # ---- validation ----
         net.eval()
         val_loss, dices, m = 0.0, [], 0
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
+        with torch.no_grad(), torch.amp.autocast('cuda',enabled=args.amp):
             for xb, yb in val_dl:
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)

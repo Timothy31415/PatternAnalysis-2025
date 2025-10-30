@@ -166,9 +166,9 @@ def discover_paired(root: str, type: str) -> Tuple[List[str], List[str]]:
         path_img = os.path.join(root,"keras_lices_train" )
         path_lab = os.path.join(root,"keras_slices_seg_train" )
 
-    if type == "vallidate":
-        path_img = os.path.join(root,"keras_slices_vallidate" )
-        path_lab = os.path.join(root,"keras_slices_seg_vallidate" )
+    if type == "validate":
+        path_img = os.path.join(root,"keras_slices_validate" )
+        path_lab = os.path.join(root,"keras_slices_seg_validate" )
 
     if type == "test":
         print("dddd")
@@ -179,6 +179,26 @@ def discover_paired(root: str, type: str) -> Tuple[List[str], List[str]]:
     imgs = subfolder_list(path_img)
     labs = subfolder_list(path_lab)
     return imgs, labs
+
+def load_one_case(img_path: str, lab_path: str, out_size=(256,128), num_classes=6):
+    """
+    Load single image+label as numpy arrays with your preprocessing:
+      - take first slice if 3D
+      - resize via torch interpolate (bilinear for image / nearest for label)
+      - z-score normalize image
+    Returns: img_hw (float32), lab_hw (int64)
+    """
+    ni, li = nib.load(img_path), nib.load(lab_path)
+    img, lab = ni.get_fdata(caching="unchanged"), li.get_fdata(caching="unchanged")
+    if img.ndim == 3: img = img[:, :, 0]
+    if lab.ndim == 3: lab = lab[:, :, 0]
+
+    img = _resize2d_torch(img, out_size, is_label=False).astype(np.float32)
+    lab = _resize2d_torch(lab, out_size, is_label=True).astype(np.int64)
+    img = _zscore(img)
+    # clip label values to [0, num_classes-1] just in case
+    lab = np.clip(lab, 0, num_classes - 1).astype(np.int64)
+    return img, lab, ni.affine
 
 # ------------------------------
 # Visualization
