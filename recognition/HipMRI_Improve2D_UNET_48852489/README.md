@@ -15,7 +15,23 @@ This Improved2D UNET architecture is inspired by this improved3D UNET architectu
 This UNET architecture is used in performing a 3D segmentation in the original paper.
 In this project, the aim is to improve 2D UNET in the similiar way based on how this 3D UNET is improved. This include the implmentation of the following: LeakyReLU, BatchNorm, different upsampling technique, Dropout, Loss function improved, deep supervision and dataset loading improvement.
 
-These improvement prevent serveal disadvantage a normal 2D Unet have, such as dead filters due to not LeakyReLU, checkboard pattern due to transposed convs, potential of overfitting.
+### Context Pathway (Encoder):
+Every downsampling stages uses pre-activation residula block rather than plain convolutional layers, Wwhere each block include two 3x3 convolutions and a dropout layer(p=0.3). This improve the gradient flow and overfitting.
+
+### Localization Pathway(Decoder):
+Using a simple upsampling with nearest neighbor, follwed by a 3x3 convlution instead of a transposed convolutions. Prevent the checkerboard artifiacts from transposed, giving better feature maps and reduce that artificat.
+
+### Localization modules:
+Normal skip connections link encoder and decoder layers at matching resolution, but the improved desgin use localization modules (3x3 and 1x1 convolutions) to concat encoder-decoder features efficiently and reduce memory usage.
+
+### Deep Supervision:
+Segmention outputs are also perform while at each step of upsampling, and their prediction are element-wise summed to form the final segmentation. This inject the gradient deeper into network, and also stabilizing training.
+
+### Normalization and Nonlinearity:
+Instance nomalization was used instead of batch normalization. And also LeakyReLU(0.01) is used instead of normal ReLu to prevent dead neuron. These changes give smoother gradient propagation into the network.
+
+### Loss function
+Loss function is also improved to using multiclass dice loss, which reduce the effect of the class size imbalance. The exact formula is discussed further down in this paper.
 
 ## Dataset
 The datset used in this project have been acquired as part of the retrospective MRI-alone radiation therapy study from the Calvary Mater Newcastle Hospital(Dowling & Greer, 2021). Having 5 labels inlcuding 0-background, 1-body, 2-Bones, 3-Bladder, 4-Rectum, 5-Prostate. The goal of this project is to obtain the dice similiarity of above 0.75 on all 6 labels mentioned by using the segmentation of the Improved2D UNET.
@@ -101,12 +117,12 @@ python predict.py
 ```
 If want to use differnt size and different number of class, use the same argument mentioed in Training Model.
 
-Note: eval_all and case_root can not be used together, eval_all will return the dice score and end the script.
 
 #### Single case
 ```
 python predict.py --data_root ".\keras_slices_data"  --model_path "improved_unet2d.pt" --case_root "Path to single case"
 ```
+Single case is just any original case you want. eg( "seg_040_week_0_slice_0.nii.gz")  
 The predict.py will automatically match the single case image to its corresponding segmentation and do comparsion, thus order of the data is important.
 ![Single inference for example](./figs/testing1.png) 
 
